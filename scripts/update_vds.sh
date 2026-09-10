@@ -13,9 +13,10 @@ if [ -f docker-compose.host.yml ] && [ "${USE_HOST_NETWORK:-1}" = "1" ]; then
 fi
 
 echo "[update] проверка версии исходников"
-if grep -q 'jenkins.pmmp.io' bot/installer.py 2>/dev/null; then
-  echo "[update] ВНИМАНИЕ: в bot/installer.py ещё старый код (jenkins.pmmp.io)."
-  echo "[update] Распакуйте свежий архив поверх проекта и повторите."
+# Проверяем наличие новой функции вместо старого URL
+if ! grep -q 'def build_php_from_source' bot/installer.py 2>/dev/null; then
+  echo "[update] ВНИМАНИЕ: в bot/installer.py устаревшая версия."
+  echo "[update] Выполните git pull и повторите."
   exit 1
 fi
 grep -m1 'INSTALLER_REVISION' bot/installer.py || true
