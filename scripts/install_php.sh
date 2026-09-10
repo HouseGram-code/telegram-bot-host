@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
-# Ручная/резервная установка бинарников PHP 7.0-7.2 с pthreads для GenisysPro.
+# Ручная/резервная установка PHP 7.x (ZTS + pthreads) для GenisysPro.
+#
+# В 2026 готовые сборки PocketMine больше не раздаются: pmmp/PHP-Binaries
+# заархивирован (только PHP 8.x), jenkins.pmmp.io и ci.pmmp.io отключены.
+# Поэтому порядок: локальный архив → PHP_BINARY_URL → сборка из исходников.
+#
 # Использование:
-#   ./scripts/install_php.sh            # пробует 7.2, затем 7.1, затем 7.0
-#   ./scripts/install_php.sh 7.1        # конкретная версия
+#   ./scripts/install_php.sh                 # автоматически
 #   PHP_BINARY_URL=https://... ./scripts/install_php.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${ROOT}/runtime/php"
 CACHE="${ROOT}/php_cache"
-ARCH="$(uname -m)"
-case "${ARCH}" in
-  x86_64|amd64) ARCH="x86_64" ;;
-  aarch64|arm64) ARCH="aarch64" ;;
-esac
+PHP_VERSION="${PHP_VERSION:-7.2.34}"
 
-VERSIONS=("${1:-7.2}" "7.2" "7.1" "7.0")
-mkdir -p "${TARGET}" "${CACHE}"
+mkdir -p "${ROOT}/runtime" "${CACHE}"
 
 try_archive() {
   local archive="$1"
@@ -27,7 +26,8 @@ try_archive() {
   binary="$(find "${staging}" -type f -path '*/bin/php' | head -n1)"
   [ -n "${binary}" ] || return 1
   chmod +x "${binary}"
-  local libdir="$(dirname "$(dirname "${binary}")")/lib"
+  local libdir
+  libdir="$(dirname "$(dirname "${binary}")")/lib"
   local version
   version="$(LD_LIBRARY_PATH="${libdir}" "${binary}" -r 'echo PHP_VERSION;' 2>/dev/null || true)"
   case "${version}" in
@@ -35,16 +35,26 @@ try_archive() {
     *) echo "  ✗ версия '${version:-?}' не подходит (нужно 7.0-7.2)"; return 1 ;;
   esac
   if ! LD_LIBRARY_PATH="${libdir}" "${binary}" -m | grep -qi pthreads; then
-    echo "  ⚠ в сборке нет pthreads — сервер может не запуститься"
+    echo "  ⚠ в сборке нет pthreads — сервер не запустится"
+    return 1
   fi
   rm -rf "${TARGET}"
-  mkdir -p "$(dirname "${TARGET}")"
   mv "${staging}" "${TARGET}"
   echo "  ✓ установлен PHP ${version} → ${TARGET}"
   return 0
 }
 
-# 1) локальные архивы (работает без интернета)
+# 1) PHP из образа (если запуск внутри контейнера)
+PREBUILT="${PHP_PREBUILT_DIR:-/opt/php7}"
+if [ ! -x "${TARGET}/bin/php" ] && [ -x "${PREBUILT}/bin/php" ]; then
+  echo "Копирую готовый PHP из ${PREBUILT}"
+  rm -rf "${TARGET}"
+  cp -a "${PREBUILT}" "${TARGET}"
+  LD_LIBRARY_PATH="${TARGET}/lib" "${TARGET}/bin/php" -v | head -n1
+  exit 0
+fi
+
+# 2) локальные архивы (работает без интернета)
 shopt -s nullglob
 for archive in "${CACHE}"/*.tar.gz "${CACHE}"/*.tgz; do
   echo "Пробую локальный архив: $(basename "${archive}")"
@@ -52,63 +62,40 @@ for archive in "${CACHE}"/*.tar.gz "${CACHE}"/*.tgz; do
 done
 shopt -u nullglob
 
-# 2) загрузка с зеркал
-urls=()
-[ -n "${PHP_BINARY_URL:-}" ] && urls+=("${PHP_BINARY_URL}")
-for version in "${VERSIONS[@]}"; do
-  tag="PHP-${version}-Linux-${ARCH}"
-  urls+=(
-    "https://jenkins.pmmp.io/job/PHP-${version}-Aggregate/lastSuccessfulBuild/artifact/${tag}.tar.gz"
-    "https://jenkins.pmmp.io/job/PHP-${version}-Aggregate/lastStableBuild/artifact/${tag}.tar.gz"
-    "https://ci.pmmp.io/job/PHP-${version}-Aggregate/lastSuccessfulBuild/artifact/${tag}.tar.gz"
-    "https://github.com/pmmp/PHP-Binaries/releases/download/php-${version}-latest/${tag}.tar.gz"
-    "https://github.com/pmmp/PHP-Binaries/releases/download/pm3-php-${version}-latest/${tag}.tar.gz"
-  )
-done
-
-for url in "${urls[@]}"; do
-  echo "Скачиваю: ${url}"
+# 3) своя ссылка из .env
+if [ -n "${PHP_BINARY_URL:-}" ]; then
+  echo "Скачиваю: ${PHP_BINARY_URL}"
   tmp="${CACHE}/php-download.tar.gz"
-  if curl -fL --connect-timeout 15 --retry 2 -o "${tmp}" "${url}"; then
-    if try_archive "${tmp}"; then
-      mv "${tmp}" "${CACHE}/$(basename "${url}")" 2>/dev/null || true
-      exit 0
-    fi
-  else
-    echo "  ✗ недоступно"
+  if curl -fL --connect-timeout 15 --retry 2 -o "${tmp}" "${PHP_BINARY_URL}" && try_archive "${tmp}"; then
+    exit 0
   fi
   rm -f "${tmp}"
-done
+  echo "  ✗ по ссылке не получилось"
+fi
 
-# 3) сборка из исходников
-if command -v git >/dev/null && command -v make >/dev/null; then
-  echo "Готовые бинарники недоступны — собираю PHP из исходников (долго)..."
-  work="${ROOT}/runtime/php-build"
-  rm -rf "${work}"; mkdir -p "${work}"
-  for ref in php7.2 php-7.2 legacy/php7.2 php7.1 master; do
-    if git clone --depth 1 --branch "${ref}" https://github.com/pmmp/php-build-scripts.git "${work}/scripts"; then
-      break
-    fi
-  done
-  if [ -f "${work}/scripts/compile.sh" ]; then
-    ( cd "${work}/scripts" && bash compile.sh -t linux64 -j "$(nproc)" -f )
-    if [ -d "${work}/scripts/bin" ]; then
-      rm -rf "${TARGET}"; mkdir -p "${TARGET}"
-      cp -r "${work}/scripts/bin" "${TARGET}/bin"
-      echo "  ✓ PHP собран из исходников"
-      exit 0
-    fi
-  fi
+# 4) сборка из исходников
+OPENSSL_MAJOR="$(openssl version 2>/dev/null | awk '{print $2}' | cut -d. -f1)"
+if [ "${OPENSSL_MAJOR:-3}" = "1" ] && command -v gcc >/dev/null && command -v make >/dev/null; then
+  echo "Собираю PHP ${PHP_VERSION} из исходников напрямую..."
+  PREFIX="${TARGET}" PHP_VERSION="${PHP_VERSION}" JOBS="$(nproc 2>/dev/null || echo 2)" \
+    bash "${ROOT}/scripts/build_php72.sh" && exit 0
+fi
+
+if command -v docker >/dev/null 2>&1; then
+  echo "Собираю PHP в контейнере debian:buster (на свежих системах с OpenSSL 3)"
+  PHP_VERSION="${PHP_VERSION}" bash "${ROOT}/scripts/build_php_docker.sh" && exit 0
 fi
 
 cat <<'EOF'
-✗ Не удалось установить PHP автоматически.
+✗ Не удалось установить PHP.
+
+Почему: в 2026 готовых бинарников PHP 7 больше нет (pmmp/PHP-Binaries
+заархивирован, jenkins.pmmp.io и ci.pmmp.io отключены).
 
 Что делать:
-  1. Скачайте архив PocketMine PHP 7.2 (linux x86_64) на любом ПК с интернетом.
-  2. Положите файл в папку php_cache/ этого проекта.
-  3. Запустите снова: ./scripts/install_php.sh   (или /install в боте)
-
-Альтернатива: укажите прямую ссылку в .env → PHP_BINARY_URL=https://...
+  1. Установите Docker и запустите:  bash scripts/build_php_docker.sh
+  2. Или положите готовый архив PHP 7.2 (linux x86_64, с pthreads)
+     в папку php_cache/ и запустите этот скрипт снова.
+  3. Или укажите ссылку в .env:  PHP_BINARY_URL=https://...
 EOF
 exit 1

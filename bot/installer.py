@@ -1,11 +1,17 @@
-"""Автоматическая установка: бинарники PHP 7.0/7.1/7.2 + конфиг сервера.
+"""Автоустановка PHP 7.x (ZTS + pthreads) и настройка сервера.
 
-Логика поиска PHP (по порядку, до первого успеха):
-  1. уже установленный PHP в runtime/php (проверка версии и pthreads);
-  2. PHP_BINARY_PATH - готовый бинарник, указанный вручную;
-  3. локальные архивы в php_cache/*.tar.gz (работает без интернета);
-  4. скачивание с зеркал PocketMine (PHP_BINARY_URL или встроенный список);
-  5. сборка из исходников через pmmp/php-build-scripts (если ALLOW_PHP_BUILD=1).
+ВАЖНО (2026): готовых бинарников PHP 7 больше не существует:
+  * pmmp/PHP-Binaries заархивирован, в релизах остались только PHP 8.x (PM4/PM5);
+  * jenkins.pmmp.io отдаёт HTML-заглушку (~300 КБ) вместо артефакта;
+  * ci.pmmp.io больше не резолвится.
+
+Поэтому порядок такой:
+  1. уже установленный PHP в runtime/php;
+  2. PHP, собранный в Docker-образе (PHP_PREBUILT_DIR, по умолчанию /opt/php7);
+  3. PHP_BINARY_PATH — готовый бинарник, указанный вручную;
+  4. локальные архивы в php_cache/*.tar.gz (работает без интернета);
+  5. PHP_BINARY_URL / старые зеркала (быстрая проверка, обычно 404);
+  6. сборка из исходников scripts/build_php72.sh (ALLOW_PHP_BUILD=1).
 """
 
 from __future__ import annotations
@@ -31,22 +37,30 @@ USER_AGENT = "mcpe-telegram-host/1.0 (+auto-installer)"
 
 
 def php_mirrors(version: str, arch: str) -> list[str]:
-    """Zerkala gotovyh binarnikov PHP s pthreads dlya PocketMine/Genisys."""
+    """Остатки старых зеркал PocketMine.
+
+    В 2026 эти ссылки почти гарантированно отдают 404 (репозиторий заархивирован),
+    поэтому список короткий: проверка занимает пару секунд, а дальше бот
+    сразу переходит к сборке из исходников. Своё зеркало можно указать
+    через PHP_BINARY_URL в .env.
+    """
     tag = "PHP-" + version + "-Linux-" + arch
-    jenkins = "https://jenkins.pmmp.io/job/PHP-" + version + "-Aggregate"
-    ci = "https://ci.pmmp.io/job/PHP-" + version + "-Aggregate"
     releases = "https://github.com/pmmp/PHP-Binaries/releases/download"
     return [
-        jenkins + "/lastSuccessfulBuild/artifact/" + tag + ".tar.gz",
-        jenkins + "/lastStableBuild/artifact/" + tag + ".tar.gz",
-        ci + "/lastSuccessfulBuild/artifact/" + tag + ".tar.gz",
+        releases + "/pm3-php-" + version + "-latest/" + tag + "-PM3.tar.gz",
         releases + "/php-" + version + "-latest/" + tag + ".tar.gz",
-        releases + "/pm3-php-" + version + "-latest/" + tag + ".tar.gz",
-        releases + "/php-" + version + "-latest/" + tag + "-PM3.tar.gz",
     ]
 
 
-BUILD_SCRIPT_REFS = ("php7.2", "php-7.2", "legacy/php7.2", "php7.1", "master")
+# какую версию PHP и pthreads собирать из исходников
+SOURCE_BUILD_MATRIX = {
+    "7.2": ("7.2.34", "3.2.0"),
+    "7.1": ("7.1.33", "3.1.6"),
+    "7.0": ("7.0.33", "3.1.6"),
+}
+
+# архив PHP всегда больше 5 МБ; всё меньшее — это страница ошибки
+MIN_ARCHIVE_BYTES = 5_000_000
 
 
 @dataclass
@@ -133,10 +147,15 @@ def _download(url: str, destination: Path, report: InstallReport) -> bool:
                     break
                 handle.write(block)
                 downloaded += len(block)
-        if downloaded < 1_000_000:  # архив PHP всегда больше 1 МБ
-            report.log(f"  ✗ слишком маленький файл ({downloaded} байт) - пропускаю")
+        if downloaded < MIN_ARCHIVE_BYTES:
+            report.log(f"  ✗ это не архив PHP ({downloaded} байт) - пропускаю")
             tmp.unlink(missing_ok=True)
             return False
+        with tmp.open("rb") as head:
+            if head.read(2) != b"\x1f\x8b":
+                report.log("  ✗ ответ не gzip (страница ошибки) - пропускаю")
+                tmp.unlink(missing_ok=True)
+                return False
         tmp.replace(destination)
         size_mb = destination.stat().st_size / 1024 / 1024
         report.log(f"  ✓ скачано {size_mb:.1f} МБ (из {total or size_mb:.0f})")
@@ -180,6 +199,31 @@ def install_php_sync(cfg: Config, report: InstallReport, force: bool = False) ->
                 report.log(f"PHP {version} уже установлен (pthreads: {'да' if pthreads else 'нет'})")
                 return report
             report.log(f"Найденный PHP не подходит (версия '{version or '?'}'), переустанавливаю")
+
+    # 1b. PHP, собранный на этапе сборки Docker-образа (/opt/php7).
+    # Папка runtime/ часто том, поэтому переносим сборку внутрь неё.
+    prebuilt_root = Path(os.environ.get("PHP_PREBUILT_DIR", "/opt/php7"))
+    prebuilt = find_php_binary(prebuilt_root) if prebuilt_root.is_dir() else None
+    if prebuilt:
+        version, pthreads = probe_php(prebuilt)
+        if version_supported(version):
+            binary = prebuilt
+            try:
+                shutil.rmtree(php_root, ignore_errors=True)
+                php_root.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(prebuilt_root, php_root, symlinks=True, dirs_exist_ok=True)
+                binary = find_php_binary(php_root) or prebuilt
+            except OSError as exc:
+                report.log(f"  ⚠ не смог скопировать PHP из образа: {exc}")
+            report.php_binary = binary
+            report.php_version = version
+            report.has_pthreads = pthreads
+            report.php_ini = php_ini_for(binary)
+            report.ok = True
+            report.log(
+                f"PHP {version} взят из образа (pthreads: " + ("да" if pthreads else "нет") + ")"
+            )
+            return report
 
     # 2. внешний бинарник
     if cfg.php_binary_path:
@@ -234,6 +278,11 @@ def install_php_sync(cfg: Config, report: InstallReport, force: bool = False) ->
     for version in versions:
         urls.extend(php_mirrors(version, cfg.arch))
 
+    if urls:
+        report.log(
+            "Проверяю зеркала (в 2026 официальных сборок PHP 7 больше нет, "
+            "это быстрая проверка на случай своего URL)"
+        )
     for url in urls:
         report.log(f"Скачиваю PHP: {url}")
         archive = cfg.cache_dir / "php-download.tar.gz"
@@ -269,8 +318,16 @@ def install_php_sync(cfg: Config, report: InstallReport, force: bool = False) ->
         return report
 
     # 5. сборка из исходников
-    if cfg.allow_php_build and shutil.which("git") and shutil.which("make"):
-        report.log("Готовые бинарники недоступны - собираю PHP из исходников (до 40 минут)")
+    toolchain_ok = bool(shutil.which("make")) and bool(
+        shutil.which("gcc") or shutil.which("cc")
+    ) and bool(shutil.which("curl"))
+    if cfg.allow_php_build and not toolchain_ok:
+        report.log(
+            "⚠ Нет компилятора (make/gcc/curl) - собрать PHP внутри контейнера невозможно. "
+            "Запустите на хосте: bash scripts/build_php_docker.sh"
+        )
+    if cfg.allow_php_build and toolchain_ok:
+        report.log("Готовых бинарников нет - собираю PHP из исходников")
         if build_php_from_source(cfg, report):
             binary = find_php_binary(php_root)
             if binary:
@@ -285,58 +342,74 @@ def install_php_sync(cfg: Config, report: InstallReport, force: bool = False) ->
 
     report.ok = False
     report.log(
-        "✗ PHP не установлен. Решение: положите архив PHP-7.2-Linux-x86_64.tar.gz "
-        "в папку php_cache/ или укажите PHP_BINARY_URL в .env, затем /install"
+        "✗ PHP не установлен. Варианты: \n"
+        "1) на хосте выполните bash scripts/build_php_docker.sh "
+        "(соберёт PHP 7.2 + pthreads в debian:buster, 10-40 минут);\n"
+        "2) положите свой архив PHP-7.2-Linux-x86_64.tar.gz в папку php_cache/;\n"
+        "3) укажите прямую ссылку PHP_BINARY_URL в .env. Потом команда /install"
     )
     return report
 
 
 def build_php_from_source(cfg: Config, report: InstallReport) -> bool:
-    work = cfg.base_dir / "runtime" / "php-build"
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True, exist_ok=True)
-    repo = "https://github.com/pmmp/php-build-scripts.git"
-    cloned = False
-    for ref in BUILD_SCRIPT_REFS:
-        result = subprocess.run(
-            ["git", "clone", "--depth", "1", "--branch", ref, repo, str(work / "scripts")],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        if result.returncode == 0:
-            report.log(f"  ✓ php-build-scripts ({ref})")
-            cloned = True
-            break
-    if not cloned:
-        report.log("  ✗ не удалось скачать php-build-scripts")
+    """Собирает PHP 7.x (ZTS) + pthreads + yaml через scripts/build_php72.sh.
+
+    Это основной способ получить PHP 7 в 2026: готовых сборок больше нет.
+    В Docker-образе PHP собирается заранее, сюда попадаем только при запуске
+    без Docker или после команды /reinstall.
+    """
+    script = Path(__file__).resolve().parent.parent / "scripts" / "build_php72.sh"
+    if not script.is_file():
+        report.log("  ✗ не найден scripts/build_php72.sh")
         return False
 
-    script_dir = work / "scripts"
-    compile_sh = script_dir / "compile.sh"
-    if not compile_sh.is_file():
-        report.log("  ✗ в репозитории нет compile.sh")
-        return False
-    compile_sh.chmod(0o755)
-    jobs = str(max(1, (os.cpu_count() or 2)))
-    result = subprocess.run(
-        ["bash", str(compile_sh), "-t", "linux64", "-j", jobs, "-f"],
-        cwd=script_dir,
-        capture_output=True,
-        text=True,
-        timeout=7200,
+    php_full, pthreads_version = SOURCE_BUILD_MATRIX.get(
+        cfg.php_version, SOURCE_BUILD_MATRIX["7.2"]
     )
+    target = cfg.php_dir
+    shutil.rmtree(target, ignore_errors=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "PREFIX": str(target),
+            "PHP_VERSION": php_full,
+            "PTHREADS_VERSION": pthreads_version,
+            "JOBS": str(max(1, os.cpu_count() or 2)),
+            "WORK": str(cfg.base_dir / "runtime" / "php-build"),
+        }
+    )
+
+    log_file = cfg.log_dir / "php-build.log"
+    report.log(
+        f"Собираю PHP {php_full} + pthreads {pthreads_version} "
+        "(10-40 минут, лог: data/logs/php-build.log)"
+    )
+    try:
+        cfg.log_dir.mkdir(parents=True, exist_ok=True)
+        with log_file.open("wb") as handle:
+            result = subprocess.run(
+                ["bash", str(script)],
+                env=env,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                timeout=10800,
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        report.log(f"  ✗ сборка не запустилась: {type(exc).__name__}: {exc}")
+        return False
+
     if result.returncode != 0:
-        tail = (result.stderr or result.stdout or "")[-500:]
-        report.log(f"  ✗ сборка завершилась с ошибкой: {tail}")
+        tail = ""
+        try:
+            tail = log_file.read_text("utf-8", errors="replace")[-400:]
+        except OSError:
+            pass
+        report.log("  ✗ сборка упала (хвост лога):\n" + tail)
         return False
-    built = script_dir / "bin"
-    if not built.is_dir():
-        report.log("  ✗ сборка не создала папку bin/")
-        return False
-    shutil.rmtree(cfg.php_dir, ignore_errors=True)
-    cfg.php_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(built, cfg.php_dir / "bin", dirs_exist_ok=True)
+
+    report.log("  ✓ сборка завершена")
     return True
 
 

@@ -1,14 +1,19 @@
 # Docker Compose v2 (без устаревшего ключа version:)
 # Запуск:  docker compose up -d --build
 # Логи:    docker compose logs -f
+#
+# Первая сборка долгая (10-40 минут): внутри образа компилируется PHP 7.2 ZTS
+# + pthreads — готовых бинарников PHP 7 в интернете больше не существует.
 
 services:
   mcpe-bot:
     build:
       context: .
       args:
-        WITH_BUILD_TOOLS: "1"
-    image: mcpe-telegram-host:1.0.0
+        WITH_BUILD_TOOLS: "0"
+        PHP_VERSION: "${PHP_BUILD_VERSION:-7.2.34}"
+        PTHREADS_VERSION: "${PTHREADS_VERSION:-3.2.0}"
+    image: mcpe-telegram-host:1.1.0
     container_name: mcpe-telegram-host
     restart: unless-stopped
     env_file:
@@ -16,6 +21,7 @@ services:
     environment:
       MCPE_BASE_DIR: /opt/mcpe
       IN_DOCKER: "1"
+      PHP_PREBUILT_DIR: /opt/php7
       TZ: ${TZ:-Asia/Chita}
     ports:
       # Главный порт MCPE (RakNet) - обязательно UDP
