@@ -1,0 +1,15 @@
+.env
+.venv/
+data/
+runtime/
+php_cache/*
+!php_cache/.gitkeep
+server/worlds/
+server/players/
+server/*.log
+server/ops.txt
+server/white-list.txt
+server/banned-*.txt
+__pycache__/
+*.pyc
+*.zip

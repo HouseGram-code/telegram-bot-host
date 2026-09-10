@@ -1,0 +1,10 @@
+# Режим host-сети: нужен на Linux, если хотите, чтобы сервер виделся
+# в списке "Сеть" (LAN-обнаружение) в Minecraft PE без ручного ввода IP.
+#
+# Запуск:
+#   docker compose -f docker-compose.yml -f docker-compose.host.yml up -d --build
+
+services:
+  mcpe-bot:
+    network_mode: host
+    ports: !reset []

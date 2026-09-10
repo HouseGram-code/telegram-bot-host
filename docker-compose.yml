@@ -1,0 +1,46 @@
+# Docker Compose v2 (без устаревшего ключа version:)
+# Запуск:  docker compose up -d --build
+# Логи:    docker compose logs -f
+
+services:
+  mcpe-bot:
+    build:
+      context: .
+      args:
+        WITH_BUILD_TOOLS: "1"
+    image: mcpe-telegram-host:1.0.0
+    container_name: mcpe-telegram-host
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MCPE_BASE_DIR: /opt/mcpe
+      IN_DOCKER: "1"
+      TZ: ${TZ:-Asia/Chita}
+    ports:
+      # Главный порт MCPE (RakNet) - обязательно UDP
+      - "${SERVER_PORT:-19132}:${SERVER_PORT:-19132}/udp"
+      # TCP для query/rcon и диагностики
+      - "${SERVER_PORT:-19132}:${SERVER_PORT:-19132}/tcp"
+      # Запасной порт (если бот автоматически выберет следующий свободный)
+      - "${SERVER_PORT_ALT:-19133}:${SERVER_PORT_ALT:-19133}/udp"
+    volumes:
+      - ./server:/opt/mcpe/server
+      - ./data:/opt/mcpe/data
+      - ./php_cache:/opt/mcpe/php_cache
+      - php-runtime:/opt/mcpe/runtime
+    stdin_open: true
+    tty: false
+    stop_grace_period: 45s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  php-runtime:

@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+data/
+php_cache/*.tar.gz
+php_cache/*.tgz
+runtime/
+server/worlds/
+server/players/
+server/*.log
+**/__pycache__/
+*.pyc
+*.zip
+README.md
