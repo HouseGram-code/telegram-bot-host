@@ -1,34 +1,40 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  Сборка PHP 7.x (ZTS) + pthreads + yaml из исходников для GenisysPro.
+#  Ревизия: 2026.09.10-2
 #
 #  Зачем: в 2026 готовых бинарников PHP 7 в интернете больше нет:
 #  pmmp/PHP-Binaries заархивирован (в релизах только PHP 8.x),
 #  jenkins.pmmp.io отдаёт HTML-заглушку, ci.pmmp.io больше не резолвится.
 #
-#  Где собирать: Debian 10 (buster) / Ubuntu 18.04-20.04 — там есть OpenSSL 1.1,
-#  без которого PHP 7.2 не собирается. На современном дистрибутиве
-#  запускайте scripts/build_php_docker.sh (сборка внутри debian:buster).
+#  Скрипт сам определяет версию OpenSSL: если в системе OpenSSL 3.x
+#  (Debian 12, Ubuntu 22.04+), то сначала собирается OpenSSL 1.1.1w рядом,
+#  потому что PHP 7.2 с OpenSSL 3 не собирается.
 #
 #  Переменные:
-#    PREFIX=/opt/php7        куда установить
-#    PHP_VERSION=7.2.34      версия PHP (7.2.34 / 7.1.33 / 7.0.33)
-#    PTHREADS_VERSION=3.2.0  версия pthreads (3.2.0 для 7.2, 3.1.6 для 7.0-7.1)
-#    YAML_VERSION=2.2.2      версия ext-yaml
-#    JOBS=4                  потоки make
+#    PREFIX=/opt/php7          куда установить
+#    PHP_VERSION=7.2.34        версия PHP (7.2.34 / 7.1.33 / 7.0.33)
+#    PTHREADS_VERSION=3.2.0    версия pthreads (3.2.0 для 7.2, 3.1.6 для 7.0-7.1)
+#    YAML_VERSION=2.2.2        версия ext-yaml
+#    OPENSSL_VERSION=1.1.1w    версия OpenSSL для собственной сборки
+#    JOBS=4                    потоки make
 # =============================================================================
 set -euo pipefail
 
+BUILD_REVISION="2026.09.10-2"
 PREFIX="${PREFIX:-/opt/php7}"
 PHP_VERSION="${PHP_VERSION:-7.2.34}"
 PTHREADS_VERSION="${PTHREADS_VERSION:-3.2.0}"
 YAML_VERSION="${YAML_VERSION:-2.2.2}"
+OPENSSL_VERSION="${OPENSSL_VERSION:-1.1.1w}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 2)}"
 WORK="${WORK:-/tmp/mcpe-php-build}"
+SSL_PREFIX="${PREFIX}/openssl"
 
 say() { echo "[build-php] $*"; }
+say "ревизия скрипта ${BUILD_REVISION}, цель: PHP ${PHP_VERSION} → ${PREFIX}"
 
-need() { command -v "$1" >/dev/null 2>&1 || { say "НЕТ утилиты: $1"; exit 2; }; }
+need() { command -v "$1" >/dev/null 2>&1 || { say "НЕТ утилиты: $1 (установите build-essential/curl)"; exit 2; }; }
 need curl; need make; need tar; need awk
 command -v gcc >/dev/null 2>&1 || need cc
 
@@ -50,7 +56,41 @@ rm -rf "${WORK}"
 mkdir -p "${WORK}"
 cd "${WORK}"
 
+# ------------------------------------------------------------------- OpenSSL
+# PHP 7.2 умеет собираться только с OpenSSL 1.0/1.1.
+SSL_ARG="--with-openssl"
+SYS_SSL="$(openssl version 2>/dev/null | awk '{print $2}' || true)"
+BUILD_SSL=1
+case "${SYS_SSL}" in
+  1.0.*|1.1.*)
+    if printf '#include <openssl/ssl.h>\nint main(void){return 0;}\n' > ssl-probe.c \
+       && { gcc -c ssl-probe.c -o ssl-probe.o >/dev/null 2>&1 || cc -c ssl-probe.c -o ssl-probe.o >/dev/null 2>&1; }; then
+      BUILD_SSL=0
+      say "системный OpenSSL ${SYS_SSL} подходит"
+    fi
+    ;;
+esac
+
+if [ "${BUILD_SSL}" = "1" ]; then
+  say "системный OpenSSL не подходит (версия: ${SYS_SSL:-нет}) — собираю OpenSSL ${OPENSSL_VERSION}"
+  download openssl.tar.gz \
+    "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" \
+    "https://www.openssl.org/source/old/1.1.1/openssl-${OPENSSL_VERSION}.tar.gz" \
+    "https://github.com/openssl/openssl/releases/download/OpenSSL_${OPENSSL_VERSION//./_}/openssl-${OPENSSL_VERSION}.tar.gz"
+  mkdir -p openssl-src
+  tar -xzf openssl.tar.gz -C openssl-src --strip-components=1
+  ( cd openssl-src \
+    && ./config --prefix="${SSL_PREFIX}" --openssldir="${SSL_PREFIX}/ssl" shared \
+    && make -j"${JOBS}" \
+    && make install_sw )
+  export PKG_CONFIG_PATH="${SSL_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  export LD_LIBRARY_PATH="${SSL_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+  SSL_ARG="--with-openssl=${SSL_PREFIX}"
+  say "OpenSSL готов: ${SSL_PREFIX}"
+fi
+
 # --------------------------------------------------------------- исходники PHP
+cd "${WORK}"
 download php.tar.gz \
   "https://www.php.net/distributions/php-${PHP_VERSION}.tar.gz" \
   "https://museum.php.net/php7/php-${PHP_VERSION}.tar.gz" \
@@ -60,18 +100,26 @@ tar -xzf php.tar.gz -C php-src --strip-components=1
 cd php-src
 [ -f configure ] || ./buildconf --force
 
+# на Debian/Ubuntu библиотеки лежат в /usr/lib/<multiarch>
+MULTIARCH="$(gcc -print-multiarch 2>/dev/null || true)"
+LIBDIR_ARG=""
+if [ -n "${MULTIARCH}" ] && [ -d "/usr/lib/${MULTIARCH}" ]; then
+  LIBDIR_ARG="--with-libdir=lib/${MULTIARCH}"
+fi
+
 say "конфигурирую PHP ${PHP_VERSION} (ZTS, thread-safe — нужно для pthreads)"
 ./configure \
   --prefix="${PREFIX}" \
   --with-config-file-path="${PREFIX}/bin" \
   --with-config-file-scan-dir="${PREFIX}/bin/conf.d" \
+  ${LIBDIR_ARG} \
   --enable-maintainer-zts \
   --enable-cli --disable-cgi --disable-phpdbg --disable-fpm \
   --without-pear --disable-opcache \
   --enable-bcmath --enable-calendar --enable-ctype --enable-filter \
   --enable-fileinfo --enable-mbstring --enable-pcntl --enable-phar \
   --enable-posix --enable-sockets --enable-zip \
-  --with-zlib --with-curl --with-openssl --with-gmp \
+  --with-zlib --with-zlib-dir=/usr --with-curl --with-gmp ${SSL_ARG} \
   --without-sqlite3 --without-pdo-sqlite
 
 say "компилирую (потоков: ${JOBS}) — от 10 до 40 минут"
@@ -111,8 +159,10 @@ tar -xzf yaml.tgz -C yaml --strip-components=1
 
 # ------------------------------------------------------------------- php.ini
 mkdir -p "${PREFIX}/bin/conf.d" "${PREFIX}/lib"
+CA_FILE="/etc/ssl/certs/ca-certificates.crt"
 cat > "${PREFIX}/bin/php.ini" <<INI
 ; PHP ${PHP_VERSION} (ZTS) для GenisysPro / PocketMine API 3.x
+; сборка ${BUILD_REVISION}
 extension_dir="${EXT_DIR}"
 extension=pthreads.so
 extension=yaml.so
@@ -122,6 +172,8 @@ phar.readonly=0
 zend.assertions=-1
 opcache.enable=0
 opcache.enable_cli=0
+openssl.cafile=${CA_FILE}
+curl.cainfo=${CA_FILE}
 error_reporting=E_ALL & ~E_DEPRECATED & ~E_NOTICE
 display_errors=1
 log_errors=1

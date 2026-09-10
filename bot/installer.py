@@ -35,6 +35,9 @@ log = logging.getLogger("installer")
 
 USER_AGENT = "mcpe-telegram-host/1.0 (+auto-installer)"
 
+# Метка сборки — видна в логах, чтобы отличить старый код от нового.
+INSTALLER_REVISION = "2026.09.10-2"
+
 
 def php_mirrors(version: str, arch: str) -> list[str]:
     """Остатки старых зеркал PocketMine.
@@ -465,7 +468,7 @@ def configure_server(cfg: Config, report: InstallReport, overwrite: bool = False
 
 async def full_install(cfg: Config, force_php: bool = False, overwrite_config: bool = False) -> InstallReport:
     report = InstallReport()
-    report.log("── Автоустановка ──")
+    report.log(f"── Автоустановка (сборка {INSTALLER_REVISION}) ──")
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, install_php_sync, cfg, report, force_php)
     await loop.run_in_executor(None, configure_server, cfg, report, overwrite_config)
